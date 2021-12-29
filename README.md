@@ -4,12 +4,12 @@ fuse-crash-recovery项目主要是构建一个基于fuse的用户态文件系统
 
 ## 原理
 
-本项目基于libfuse构建。整个方案实现包含两部分，一部分在Linux内核的fuse部分，主要实现在crash恢复阶段
-将inflighting的IO请求重新放回fuse的Pending队列中，以待恢复后的用户态fuse文件系统服务重新获取此IO请求；
-另一部分基于libfuse构建（是否使用libfuse并没有强依赖)，在libfuse的passthrough_ll样例中展示了用户态的
-实现方式。
+本项目基于libfuse(https://github.com/libfuse/libfuse.git)构建。整个方案实现包含两部分，一部分在Linux
+内核的fuse部分，主要实现在crash恢复阶段将in-flighting的IO请求重新放回fuse的Pending队列中，以待恢复后的
+用户态fuse文件系统服务重新获取此IO请求；另一部分基于libfuse构建（是否使用libfuse并没有强依赖)，在libfuse
+的passthrough_ll样例中展示了用户态的实现方式。
 
-内核部分见patch：
+Linux内核部分见patch：
 https://github.com/OpenCloudOS/OpenCloudOS-Kernel/commit/e1c207b3e7cdfd98ce1120a38c979d748e95f958
 
 ## 进展
@@ -50,10 +50,9 @@ void main(void)
        posix_memalign((void **)&buf, 512, 4096);
        fd = open("/mnt3/test1.file", O_DIRECT,0755);
        while ( (ret = read(fd,buf,4096)) > 0) {
-               //sleep(1);
+               sleep(1);
                size += ret;
                printf(" read +%d, t=%d \n", ret, size);
-
        }
 }
 ```
@@ -79,10 +78,8 @@ void main(void)
         while ( (ret = write(fd,buf,4096)) > 0) {
                 sleep(1);
                 size += ret;
-                printf(" read +%d, t=%d \n", ret, size);
-
+                printf(" write +%d, t=%d \n", ret, size);
         }
-        printf(" #### ret = %d, size=%d \n", ret, size);
 }
 ```
 
