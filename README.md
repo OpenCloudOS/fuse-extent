@@ -6,7 +6,7 @@ fuse-extent项目致力于扩展fuse的功能，增强fuse的性能。目前主�
 2. fuse-based-ebpf
  该子项目主要是基于ebpf来提升fuse的性能。
 
-##fuse-crash-recovery
+## fuse-crash-recovery
 
 ### 原理
 
@@ -88,13 +88,13 @@ void main(void)
         }
 }
 ```
-##fuse-based-ebpf
+## fuse-based-ebpf
 
-###原理
+### 原理
 
 fuse-based-ebpf的优化主要是针对部分操作，如高频的lookup，通过ebpf在内核部分生成cache，在用户执行
 lookup时无需再与用户态文件系统服务进程交互，从而提升fuse文件系统的性能。
 
-###组件
+### 组件
 组件包括一个libextfuse库（包括epbf程序），内核patch: https://github.com/OpenCloudOS/OpenCloudOS-Kernel/commit
 /eab7730c17c6ed5d61efdf01e7213674e37d863f.
