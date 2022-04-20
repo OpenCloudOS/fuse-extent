@@ -15,6 +15,8 @@ fuse-extent项目致力于扩展fuse的功能，增强fuse的性能。目前主�
 用户态fuse文件系统服务重新获取此IO请求；另一部分基于libfuse构建（是否使用libfuse并没有强依赖)，在libfuse
 的passthrough_ll样例中展示了用户态的实现方式。
 
+用户态代码路径：
+https://github.com/OpenCloudOS/libfuse branch:fuse-extent
 Linux内核部分见patch：
 https://github.com/OpenCloudOS/OpenCloudOS-Kernel/commit/e1c207b3e7cdfd98ce1120a38c979d748e95f958
 
