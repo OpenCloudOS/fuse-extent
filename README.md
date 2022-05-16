@@ -1,3 +1,5 @@
+![img](images/fuse.png)
+
 # fuse-extent
 
 fuse-extent项目致力于扩展fuse的功能，增强fuse的性能。目前主要包括两个子项目：
