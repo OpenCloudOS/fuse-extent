@@ -1,0 +1,21 @@
+#!/bin/bash ../functions.sh
+
+# add press
+scalability_list="case-ksm-hugepages case-lru-memcg case-swapin"
+
+do_loop() {
+    exit
+    while true;do
+        for tcase in $scalability_list;do
+            (cd ../;./$tcase)
+        done
+    done
+}
+
+start () {
+    do_loop &
+}
+
+stop (){
+    echo "stop"
+}

@@ -1,0 +1,30 @@
+#!/bin/bash ../functions.sh
+
+test_task=mmap_test # you need provide the fuse disk
+nr_cpu=$(grep -c processor /proc/cpuinfo)
+total_node=$(echo /sys/devices/system/node/node* | wc -w)
+mem_in_kb=$(sed -n '/MemTotal/p' /proc/meminfo | awk '{print $2}')
+
+start () {
+    local nr_vm=${1:-1}
+    local mem_in_per_node
+    local mem_in_container
+
+    echo "Start $test_task"
+    mem_in_container=$((mem_in_kb * 1024 / nr_vm))
+
+    # per node will use 1/20 memory
+    mem_in_per_node=$((mem_in_container/total_node/20))
+
+    for cpu in `seq $total_node`;do
+        $test_task $mem_in_per_node &
+    done
+}
+
+stop (){
+    echo "Kill $test_task"
+    for pid in $(pidof $test_task);do
+        kill -17 $pid 2>/dev/null >/dev/null
+        kill -9 $pid; 2>/dev/null >/dev/null
+    done
+}

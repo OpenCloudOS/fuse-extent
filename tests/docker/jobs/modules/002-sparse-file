@@ -1,0 +1,80 @@
+#!/bin/bash ../functions.sh
+
+sparsedir="/sparse_test"
+sparsedev="$sparsedir/sparsedev.img"  # must in fuse filesystem
+sparseroot="$sparsedir/root"
+total_mem=$(sed -n '/MemTotal/p' /proc/meminfo | awk '{print $2}')
+
+create_loop_devices(){
+    local i
+
+    modprobe loop 2>/dev/null
+    [ -e "/dev/loop0" ] || {
+        modprobe loop 2>/dev/null
+    }
+
+    for i in $(seq 0 104); do
+        [ -e "/dev/loop$i" ] && {
+            continue
+        }
+        mknod /dev/loop$i b 7 $i
+    done
+}
+
+create_sparse_root () {
+    local memsize=${1:-1024000000}
+
+    mkdir -p $sparsedir
+    mount -t tmpfs tmpfs $sparsedir 2>/dev/null >/dev/null
+
+    truncate -s $memsize $sparsedev
+    mkfs.ext4 -q -F $sparsedev
+
+    mkdir -p $sparseroot
+    create_loop_devices
+    mount -o loop $sparsedev $sparseroot 2>/dev/null || {
+        exit
+    }
+}
+
+create_sparse_file () {
+    local i
+    local count=${1:-10000}
+
+    cd $sparseroot
+    for i in $(seq $count);do
+        truncate ./file.$i -s $((1024*1024))
+    done
+}
+
+create_sparse(){
+    local filecount
+    local mem_in_mbyte
+    local nr_vm=${1:-1}
+    local filesystem_size
+    local container_memmbyte
+
+    container_memmbyte=$((total_mem/1024/nr_vm))
+
+    # use 1/8 of memory to save files
+    filecount=$((container_memmbyte/8))
+    # use 1/4 of memory to create ext4 filesystem
+    filesystem_size=$((filecount*1024*1024*2))
+
+    create_sparse_root $filesystem_size
+    create_sparse_file $filecount
+}
+
+delete_sparse(){
+    umount $sparseroot 2>/dev/null >/dev/null
+    umount $sparsedir 2>/dev/null >/dev/null
+    rm -rf $sparsedir 2>/dev/null
+}
+
+start () {
+    create_sparse $1 &
+}
+
+stop (){
+    delete_sparse
+}
