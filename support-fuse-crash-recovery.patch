@@ -1,0 +1,495 @@
+From 2b72e91b351db9e38bd994f8ad76cfb28c5f140e Mon Sep 17 00:00:00 2001
+From: Peng Hao <flyingpeng@tencent.com>
+Date: Mon, 27 Dec 2021 12:02:32 +0800
+Subject: [PATCH] support fuse crash recovery
+
+Signed-off-by: Peng Hao <flyingpeng@tencent.com>
+---
+ example/passthrough_ll.c | 136 ++++++++++++++++++++++++++++-----------
+ include/fuse_lowlevel.h  |   7 +-
+ lib/fuse_i.h             |   2 +-
+ lib/fuse_lowlevel.c      |  96 ++++++++++++++++++++++++++-
+ lib/fuse_versionscript   |   5 ++
+ lib/helper.c             |   2 +-
+ lib/mount.c              |  26 ++++----
+ 7 files changed, 218 insertions(+), 56 deletions(-)
+
+diff --git a/example/passthrough_ll.c b/example/passthrough_ll.c
+index a1d237a..7d113bc 100644
+--- a/example/passthrough_ll.c
++++ b/example/passthrough_ll.c
+@@ -36,6 +36,7 @@
+ 
+ #define _GNU_SOURCE
+ #define FUSE_USE_VERSION 34
++#define FUSE_DEV_IOC_RECOVERY 2147804672
+ 
+ #include "config.h"
+ 
+@@ -54,6 +55,10 @@
+ #include <pthread.h>
+ #include <sys/file.h>
+ #include <sys/xattr.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/wait.h>
++#include <sys/types.h>
+ 
+ #include "passthrough_helpers.h"
+ 
+@@ -799,13 +804,13 @@ static void lo_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync,
+ 
+ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+ {
+-	int fd;
++	//int fd;
+ 	char buf[64];
+ 	struct lo_data *lo = lo_data(req);
+ 
+ 	if (lo_debug(req))
+-		fuse_log(FUSE_LOG_DEBUG, "lo_open(ino=%" PRIu64 ", flags=%d)\n",
+-			ino, fi->flags);
++		fuse_log(FUSE_LOG_DEBUG, "lo_open(ino=%" PRIu64 ", flags=%d, fd=%d)\n",
++			ino, fi->flags, lo_fd(req, ino));
+ 
+ 	/* With writeback cache, kernel may send read requests even
+ 	   when userspace opened write-only */
+@@ -824,11 +829,8 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+ 		fi->flags &= ~O_APPEND;
+ 
+ 	sprintf(buf, "/proc/self/fd/%i", lo_fd(req, ino));
+-	fd = open(buf, fi->flags & ~O_NOFOLLOW);
+-	if (fd == -1)
+-		return (void) fuse_reply_err(req, errno);
+ 
+-	fi->fh = fd;
++	fi->fh = lo_fd(req, ino);
+ 	if (lo->cache == CACHE_NEVER)
+ 		fi->direct_io = 1;
+ 	else if (lo->cache == CACHE_ALWAYS)
+@@ -839,8 +841,8 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+ static void lo_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+ {
+ 	(void) ino;
+-
+-	close(fi->fh);
++	(void) fi;
++	//close(fi->fh);
+ 	fuse_reply_err(req, 0);
+ }
+ 
+@@ -1182,12 +1184,19 @@ static const struct fuse_lowlevel_ops lo_oper = {
+ 
+ int main(int argc, char *argv[])
+ {
++	pid_t pid;
++	int mfd, status;
++	int recovery = 0, se_size;
++	void *gse;
+ 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+-	struct fuse_session *se;
++	struct fuse_session *se = NULL;
+ 	struct fuse_cmdline_opts opts;
+ 	struct fuse_loop_config config;
+ 	struct lo_data lo = { .debug = 0,
+ 	                      .writeback = 0 };
++	struct lo_inode *prev, *next;
++	struct lo_inode gnode;
++	struct stat statbuf;
+ 	int ret = -1;
+ 
+ 	/* Don't mask creation mode, kernel already did that */
+@@ -1226,6 +1235,17 @@ int main(int argc, char *argv[])
+ 
+ 	lo.debug = opts.debug;
+ 	lo.root.refcount = 2;
++
++	/* make source directory and test file "test1.file" */
++	mkdir("/tmp/test", 0777);
++	system("dd if=/dev/zero of=/tmp/test/test1.file bs=1M count=200");
++	gnode.fd = open("/tmp/test/test1.file", O_RDWR);
++	fstat(gnode.fd, &statbuf);
++	gnode.ino = statbuf.st_ino;
++	gnode.dev = statbuf.st_dev;
++	gnode.refcount =1;
++
++	lo.source = "/tmp/test";
+ 	if (lo.source) {
+ 		struct stat stat;
+ 		int res;
+@@ -1270,39 +1290,77 @@ int main(int argc, char *argv[])
+ 			 lo.source);
+ 		exit(1);
+ 	}
++	/* add gnode into lo.root list for lookup */
++	prev = &lo.root;
++        next = prev->next;
++        next->prev = &gnode;
++        gnode.next = next;
++        gnode.prev = prev;
++        prev->next = &gnode;
++	mfd = open("/dev/fuse", O_RDWR);
++	if (mfd < 0)
++		exit(1);
++	se_size = fuse_session_size();
++	gse = (void *) mmap(NULL, se_size, PROT_WRITE|PROT_READ, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
++	memset(gse,0,se_size);
++	fuse_session_set_saveptr(gse);
++
++RECOVERY:
++	pid = fork();
++	if (pid < 0)
++		exit(1);
++	if (pid == 0) { /* in child process */
++		se = fuse_session_new(&args, &lo_oper, sizeof(lo_oper), &lo);
++		if (se == NULL)
++			exit(1);
++		if (recovery == 0) {
++			if (fuse_session_mount2(se, opts.mountpoint, mfd) != 0) {
++				fuse_session_destroy(se);
++				exit(1);
++			}
++		}
++		if (recovery == 1) {
++			fuse_session_recovery(se, gse);
++		}
++		fuse_daemonize(opts.foreground);
+ 
+-	se = fuse_session_new(&args, &lo_oper, sizeof(lo_oper), &lo);
+-	if (se == NULL)
+-	    goto err_out1;
+-
+-	if (fuse_set_signal_handlers(se) != 0)
+-	    goto err_out2;
+-
+-	if (fuse_session_mount(se, opts.mountpoint) != 0)
+-	    goto err_out3;
+-
+-	fuse_daemonize(opts.foreground);
+-
+-	/* Block until ctrl+c or fusermount -u */
+-	if (opts.singlethread)
+-		ret = fuse_session_loop(se);
+-	else {
+-		config.clone_fd = opts.clone_fd;
+-		config.max_idle_threads = opts.max_idle_threads;
+-		ret = fuse_session_loop_mt(se, &config);
++		if (opts.singlethread)
++			ret = fuse_session_loop(se);
++		else {
++			config.clone_fd = opts.clone_fd;
++			config.max_idle_threads = opts.max_idle_threads;
++			ret = fuse_session_loop_mt(se, &config);
++		}
++		exit(0);
+ 	}
+ 
+-	fuse_session_unmount(se);
+-err_out3:
+-	fuse_remove_signal_handlers(se);
+-err_out2:
+-	fuse_session_destroy(se);
++	if (pid > 0) {
++		if (pid == wait(&status)) {
++			if (WIFEXITED(status) && (WEXITSTATUS(status) == 0) &&  \
++				(WIFSIGNALED(status) == 0) && (WIFSTOPPED(status) == 0))
++				printf(" child normal end \n");
++			else {
++				ioctl(mfd, FUSE_DEV_IOC_RECOVERY, 0);
++				recovery = 1;
++				goto RECOVERY;
++			}
++		} else {
++			ioctl(mfd, FUSE_DEV_IOC_RECOVERY, 0);
++			recovery = 1;
++			goto RECOVERY;
++		}
++		if (se) {
++			fuse_session_unmount(se);
++			fuse_session_destroy(se);
++		}
++		munmap(gse, se_size);
+ err_out1:
+-	free(opts.mountpoint);
+-	fuse_opt_free_args(&args);
++		free(opts.mountpoint);
++		fuse_opt_free_args(&args);
+ 
+-	if (lo.root.fd >= 0)
+-		close(lo.root.fd);
++		if (lo.root.fd >= 0)
++			close(lo.root.fd);
+ 
+-	return ret ? 1 : 0;
++		return ret ? 1 : 0;
++	}
+ }
+diff --git a/include/fuse_lowlevel.h b/include/fuse_lowlevel.h
+index d73e9fa..13b9a1f 100644
+--- a/include/fuse_lowlevel.h
++++ b/include/fuse_lowlevel.h
+@@ -1942,7 +1942,7 @@ struct fuse_session *fuse_session_new(struct fuse_args *args,
+  * @return 0 on success, -1 on failure.
+  **/
+ int fuse_session_mount(struct fuse_session *se, const char *mountpoint);
+-
++int fuse_session_mount2(struct fuse_session *se, const char *mountpoint, int mfd);
+ /**
+  * Enter a single threaded, blocking event loop.
+  *
+@@ -2092,7 +2092,10 @@ void fuse_session_process_buf(struct fuse_session *se,
+  * @return the actual size of the raw request, or -errno on error
+  */
+ int fuse_session_receive_buf(struct fuse_session *se, struct fuse_buf *buf);
+-
++void fuse_session_recovery(struct fuse_session *se, void * oldse);
++int fuse_session_size(void);
++void fuse_session_set_saveptr(void * ptr);
++void fuse_session_save(struct fuse_session *se);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/lib/fuse_i.h b/lib/fuse_i.h
+index d38b630..ab7af85 100644
+--- a/lib/fuse_i.h
++++ b/lib/fuse_i.h
+@@ -111,7 +111,7 @@ void destroy_mount_opts(struct mount_opts *mo);
+ void fuse_mount_version(void);
+ unsigned get_max_read(struct mount_opts *o);
+ void fuse_kern_unmount(const char *mountpoint, int fd);
+-int fuse_kern_mount(const char *mountpoint, struct mount_opts *mo);
++int fuse_kern_mount(const char *mountpoint, struct mount_opts *mo, int mfd);
+ 
+ int fuse_send_reply_iov_nofree(fuse_req_t req, int error, struct iovec *iov,
+ 			       int count);
+diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
+index e5de2a5..9d7337d 100644
+--- a/lib/fuse_lowlevel.c
++++ b/lib/fuse_lowlevel.c
+@@ -128,6 +128,48 @@ static void destroy_req(fuse_req_t req)
+ 	free(req);
+ }
+ 
++int fuse_session_size(void)
++{
++	int size;
++	size = sizeof(struct fuse_session);
++	return size;
++}
++
++static struct fuse_session * global_se = NULL;
++
++void fuse_session_set_saveptr(void * ptr)
++{
++	global_se = (struct fuse_session *) ptr;
++}
++
++void fuse_session_save(struct fuse_session *se)
++{
++	memcpy(global_se, se, sizeof(struct fuse_session));
++	fuse_log(FUSE_LOG_ERR," fuse_session_save minor=%d,%d \n", se->conn.proto_minor, global_se->conn.proto_minor);
++}
++
++void fuse_session_recovery(struct fuse_session *se, void * oldse)
++{
++	struct fuse_session * save_se = (struct fuse_session *) oldse;
++	se->conn.proto_major = save_se->conn.proto_major;
++	se->conn.proto_minor = save_se->conn.proto_minor;
++	se->conn.capable = save_se->conn.capable;
++	se->conn.want = save_se->conn.want;
++	se->conn.capable = save_se->conn.capable;
++	se->conn.max_readahead = save_se->conn.max_readahead;
++	se->conn.want = save_se->conn.want;
++	se->conn.time_gran = save_se->conn.time_gran;
++	se->bufsize = save_se->bufsize;
++	se->got_init = save_se->got_init;
++	se->conn.max_background = save_se->conn.max_background;
++	se->conn.congestion_threshold = save_se->conn.congestion_threshold;
++	se->exited = 0;
++	se->fd = save_se->fd;
++	se->mountpoint = save_se->mountpoint;
++	se->pipe_key = save_se->pipe_key;
++}
++
++
+ void fuse_free_req(fuse_req_t req)
+ {
+ 	int ctr;
+@@ -2149,6 +2191,8 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
+ 	else if (arg->minor < 23)
+ 		outargsize = FUSE_COMPAT_22_INIT_OUT_SIZE;
+ 
++	/* save init state */
++	fuse_session_save(se);
+ 	send_reply_ok(req, &outarg, outargsize);
+ }
+ 
+@@ -3007,6 +3051,56 @@ out1:
+ 	return NULL;
+ }
+ 
++int fuse_session_mount2(struct fuse_session *se, const char *mountpoint, int mfd)
++{
++	int fd;
++
++        /*
++         * Make sure file descriptors 0, 1 and 2 are open, otherwise chaos
++         * would ensue.
++         */
++	do {
++		fd = open("/dev/null", O_RDWR);
++		if (fd > 2)
++			close(fd);
++	} while (fd >= 0 && fd <= 2);
++
++        /*
++         * To allow FUSE daemons to run without privileges, the caller may open
++         * /dev/fuse before launching the file system and pass on the file
++         * descriptor by specifying /dev/fd/N as the mount point. Note that the
++         * parent process takes care of performing the mount in this case.
++         */
++	fd = fuse_mnt_parse_fuse_fd(mountpoint);
++	if (fd != -1) {
++		if (fcntl(fd, F_GETFD) == -1) {
++			fuse_log(FUSE_LOG_ERR,
++                                "fuse: Invalid file descriptor /dev/fd/%u\n",
++                                fd);
++			return -1;
++		}
++		se->fd = fd;
++		return 0;
++	}
++
++	/* Open channel */
++	fd = fuse_kern_mount(mountpoint, se->mo, mfd);
++	if (fd == -1)
++		return -1;
++	se->fd = fd;
++
++	/* Save mountpoint */
++	se->mountpoint = strdup(mountpoint);
++	if (se->mountpoint == NULL)
++		goto error_out;
++
++	return 0;
++
++error_out:
++	fuse_kern_unmount(mountpoint, fd);
++	return -1;
++}
++
+ int fuse_session_mount(struct fuse_session *se, const char *mountpoint)
+ {
+ 	int fd;
+@@ -3040,7 +3134,7 @@ int fuse_session_mount(struct fuse_session *se, const char *mountpoint)
+ 	}
+ 
+ 	/* Open channel */
+-	fd = fuse_kern_mount(mountpoint, se->mo);
++	fd = fuse_kern_mount(mountpoint, se->mo, -1);
+ 	if (fd == -1)
+ 		return -1;
+ 	se->fd = fd;
+diff --git a/lib/fuse_versionscript b/lib/fuse_versionscript
+index a06f768..095c513 100644
+--- a/lib/fuse_versionscript
++++ b/lib/fuse_versionscript
+@@ -20,6 +20,10 @@ FUSE_3.0 {
+ 		fuse_session_loop_mt;
+ 		fuse_session_reset;
+ 		fuse_session_fd;
++		fuse_session_recovery;
++		fuse_session_save;
++		fuse_session_set_saveptr;
++		fuse_session_size;
+ 		fuse_opt_parse;
+ 		fuse_opt_add_opt;
+ 		fuse_opt_add_arg;
+@@ -40,6 +44,7 @@ FUSE_3.0 {
+ 		fuse_main_real;
+ 		fuse_mount;
+ 		fuse_session_mount;
++		fuse_session_mount2;
+ 		fuse_new;
+ 		fuse_opt_insert_arg;
+ 		fuse_reply_lock;
+diff --git a/lib/helper.c b/lib/helper.c
+index 64ff7ad..f10e8e4 100644
+--- a/lib/helper.c
++++ b/lib/helper.c
+@@ -433,7 +433,7 @@ int fuse_open_channel(const char *mountpoint, const char* options)
+ 	if (opts == NULL)
+ 		return -1;
+ 
+-	fd = fuse_kern_mount(mountpoint, opts);
++	fd = fuse_kern_mount(mountpoint, opts, -1);
+ 	destroy_mount_opts(opts);
+ 
+ 	return fd;
+diff --git a/lib/mount.c b/lib/mount.c
+index 979f8d9..97ca70f 100644
+--- a/lib/mount.c
++++ b/lib/mount.c
+@@ -382,14 +382,14 @@ static int fuse_mount_fusermount(const char *mountpoint, struct mount_opts *mo,
+ #endif
+ 
+ static int fuse_mount_sys(const char *mnt, struct mount_opts *mo,
+-			  const char *mnt_opts)
++			  const char *mnt_opts, int mfd)
+ {
+ 	char tmp[128];
+ 	const char *devname = "/dev/fuse";
+ 	char *source = NULL;
+ 	char *type = NULL;
+ 	struct stat stbuf;
+-	int fd;
++	int fd = mfd;
+ 	int res;
+ 
+ 	if (!mnt) {
+@@ -410,14 +410,16 @@ static int fuse_mount_sys(const char *mnt, struct mount_opts *mo,
+ 		return -2;
+ 	}
+ 
+-	fd = open(devname, O_RDWR | O_CLOEXEC);
+-	if (fd == -1) {
+-		if (errno == ENODEV || errno == ENOENT)
+-			fuse_log(FUSE_LOG_ERR, "fuse: device not found, try 'modprobe fuse' first\n");
+-		else
+-			fuse_log(FUSE_LOG_ERR, "fuse: failed to open %s: %s\n",
+-				devname, strerror(errno));
+-		return -1;
++	if (fd <= 0) {
++		fd = open(devname, O_RDWR | O_CLOEXEC);
++		if (fd == -1) {
++			if (errno == ENODEV || errno == ENOENT)
++				fuse_log(FUSE_LOG_ERR, "fuse: device not found, try 'modprobe fuse' first\n");
++			else
++				fuse_log(FUSE_LOG_ERR, "fuse: failed to open %s: %s\n",
++					devname, strerror(errno));
++			return -1;
++		}
+ 	}
+ 	if (!O_CLOEXEC)
+ 		fcntl(fd, F_SETFD, FD_CLOEXEC);
+@@ -558,7 +560,7 @@ void destroy_mount_opts(struct mount_opts *mo)
+ }
+ 
+ 
+-int fuse_kern_mount(const char *mountpoint, struct mount_opts *mo)
++int fuse_kern_mount(const char *mountpoint, struct mount_opts *mo, int mfd)
+ {
+ 	int res = -1;
+ 	char *mnt_opts = NULL;
+@@ -571,7 +573,7 @@ int fuse_kern_mount(const char *mountpoint, struct mount_opts *mo)
+ 	if (mo->mtab_opts &&  fuse_opt_add_opt(&mnt_opts, mo->mtab_opts) == -1)
+ 		goto out;
+ 
+-	res = fuse_mount_sys(mountpoint, mo, mnt_opts);
++	res = fuse_mount_sys(mountpoint, mo, mnt_opts, mfd);
+ 	if (res == -2) {
+ 		if (mo->fusermount_opts &&
+ 		    fuse_opt_add_opt(&mnt_opts, mo->fusermount_opts) == -1)
+-- 
+2.27.0
+
