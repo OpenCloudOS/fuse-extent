@@ -12,7 +12,16 @@ Linux内核部分见patch: https://github.com/OpenCloudOS/OpenCloudOS-Kernel/com
 ### 介绍
 FUSE 是一个用户态文件系统的框架。它由内核模块 (fuse.ko)，用户空间库 (libfuse.*) 以及一个挂载程序 (fusermount) 组成，用户借助 libfuse 编写自定义的用户态文件系统。在这个项目中，我们去除对 libfuse 的依赖，使用内核提供的接口，实现一个用户态文件系统，并具有 crash-recovery 功能，在用户态守护进程故障后恢复重启。
 
-### 说明
+### fuse-crash-recovery 第一版（依赖libfuse）
+ 基于libfuse(https://github.com/libfuse/libfuse.git)构建。整个方案实现包含两部分，一部分在Linux
+ 内核的fuse部分，主要实现在crash恢复阶段将in-flighting的IO请求重新放回fuse的Pending队列中，以待恢复后的
+ 用户态fuse文件系统服务重新获取此IO请求；另一部分基于libfuse构建（是否使用libfuse并没有强依赖)，在libfuse
+ 的passthrough_ll样例中展示了用户态的实现方式。
+
+ 用户态代码路径：
+ https://github.com/OpenCloudOS/libfuse branch:fuse-extent
+
+### fuse-crash-recovery 第二版 （不依赖libfuse）
 1. 当前版本不支持 fuseblk；
 2. 实现了主要的文件系统功能（部分文件系统功能未实现，如 symlink 等）；
 3. 同时目前实现的故障恢复功能不支持多线程模式在启用 `--clonefd` 选项，即 `ioctl(FUSE_DEV_IOC_CLONE)` 情况下的故障恢复；
